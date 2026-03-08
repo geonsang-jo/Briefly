@@ -1,0 +1,28 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <clipPath id="iconClipDock">
+      <rect x="0" y="0" width="1024" height="1024" rx="220" ry="220"/>
+    </clipPath>
+  </defs>
+
+  <!-- Dock-only variant: scale down the entire original icon for more safe area -->
+  <g transform="translate(82 82) scale(0.84)">
+    <rect x="0" y="0" width="1024" height="1024" rx="220" ry="220" fill="#F2F2F2"/>
+
+    <g clip-path="url(#iconClipDock)">
+      <g transform="rotate(7 512 512)">
+        <text
+          x="512"
+          y="1080"
+          text-anchor="middle"
+          font-size="820"
+          font-weight="800"
+          font-family="Nunito, Arial Rounded MT Bold, Helvetica Rounded, Arial, sans-serif"
+          letter-spacing="-28"
+          fill="#111111">
+          24
+        </text>
+      </g>
+    </g>
+  </g>
+</svg>
