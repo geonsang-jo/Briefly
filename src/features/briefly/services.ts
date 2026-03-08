@@ -3,7 +3,9 @@ import type {
   AutoConversationResult,
   DetectLogPathsResult,
   FinishCommandResult,
+  MergedSummaryData,
   ProfileConfig,
+  ProviderSummaryData,
   SummaryRecordFile,
 } from "@/features/briefly/types";
 
@@ -108,7 +110,10 @@ export async function requestSaveRecordToFs(
   record: Pick<
     SummaryRecordFile,
     "id" | "createdAt" | "provider" | "summary" | "dateKey"
-  >,
+  > & {
+    providerResults?: ProviderSummaryData[];
+    merged?: MergedSummaryData;
+  },
 ): Promise<void> {
   if (!isTauriAvailable()) {
     throw new Error("Tauri 런타임이 아니어서 요약 파일 저장을 실행할 수 없습니다.");

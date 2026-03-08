@@ -18,6 +18,8 @@ export type SummaryRecord = {
   summary: string;
   conversation: string;
   dateKey?: string;
+  providerResults?: ProviderSummaryData[];
+  merged?: MergedSummaryData;
 };
 
 export type SummaryRecordFile = {
@@ -26,6 +28,46 @@ export type SummaryRecordFile = {
   provider: "terminal" | "local";
   dateKey: string;
   summary: string;
+  providerResults?: ProviderSummaryData[];
+  merged?: MergedSummaryData;
+};
+
+export type SummaryEvidenceItem = {
+  time: string;
+  source: string;
+  text: string;
+};
+
+export type ProviderSummaryData = {
+  version: "1";
+  provider: string;
+  dateKey: string;
+  oneLineSummary: string;
+  doneTodos: string[];
+  workLogs: string[];
+  issues: string[];
+  evidence: SummaryEvidenceItem[];
+};
+
+export type MergedSummaryData = {
+  version: "1";
+  dateKey: string;
+  connectedProviders: string[];
+  dailySummary: string;
+  doneTodos: string[];
+  workLogs: string[];
+  issues: string[];
+  evidence: SummaryEvidenceItem[];
+  contexts: SummaryContextData[];
+};
+
+export type SummaryContextData = {
+  name: string;
+  summary: string;
+  doneTodos: string[];
+  workLogs: string[];
+  issues: string[];
+  evidence: SummaryEvidenceItem[];
 };
 
 export type FinishCommandResult = {

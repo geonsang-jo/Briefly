@@ -29,9 +29,13 @@ import type {
   AppView,
   DetectLogPathsResult,
   FeedbackTone,
+  MergedSummaryData,
   PathCheckStatus,
   PathProviderKey,
   ProfileConfig,
+  ProviderSummaryData,
+  SummaryContextData,
+  SummaryEvidenceItem,
   SummaryRecord,
 } from "@/features/briefly/types";
 import {
@@ -61,6 +65,7 @@ const DEFAULT_WRAPUP_COMMAND_BY_PROVIDER: Partial<
   codex: "codex exec --skip-git-repo-check -",
   gemini: "gemini -p",
 };
+const DEFAULT_CONTEXT_NAME = "General";
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => {
@@ -137,6 +142,10 @@ function buildWrapUpPrompt(
     "- Merge duplicates.",
     "- Prefer outcomes over chat noise.",
     "- Keep each bullet to one sentence.",
+    '- Prefix every bullet in "오늘 한 일 / 완료한 TODO / 이슈/메모 / 근거 로그" with a context tag: [Context] ...',
+    "- Use short context names like [Briefly], [Work], [Personal], [Study].",
+    `- If context is unclear, use [${DEFAULT_CONTEXT_NAME}].`,
+    "- If logs clearly show completion (for example git push success or repository creation), classify it as completed TODO ([x]), not next TODO.",
     "",
     "Output format (must follow exactly):",
     "",
@@ -144,32 +153,27 @@ function buildWrapUpPrompt(
     "- ...",
     "",
     "## 오늘 한 일",
-    "- ...",
+    "- [Context] ...",
     "",
     "## 완료한 TODO",
-    "- [x] ...",
-    "",
-    "## 다음 TODO",
-    "- [ ] ...",
+    "- [x] [Context] ...",
     "",
     "## 이슈/메모",
-    "- ...",
+    "- [Context] ...",
     "",
     "## 근거 로그",
-    "- [HH:mm] [source] ...",
-    "- [HH:mm] [source] ...",
+    "- [HH:mm] [source] [Context] ...",
+    "- [HH:mm] [source] [Context] ...",
     "",
     "If there is no meaningful work log, output:",
     "## 한 줄 요약",
     "- 오늘 작업 로그가 충분하지 않습니다.",
     "## 오늘 한 일",
-    "- 없음",
+    `- [${DEFAULT_CONTEXT_NAME}] 없음`,
     "## 완료한 TODO",
     "- [x] 없음",
-    "## 다음 TODO",
-    "- [ ] 작업 로그 수집 방식 점검",
     "## 이슈/메모",
-    "- 로그 데이터 부족",
+    `- [${DEFAULT_CONTEXT_NAME}] 로그 데이터 부족`,
     "## 근거 로그",
     "- 없음",
     "",
@@ -179,6 +183,398 @@ function buildWrapUpPrompt(
     "",
     conversation,
   ].join("\n");
+}
+
+function extractSectionBody(markdown: string, sectionTitle: string): string {
+  const escapedTitle = sectionTitle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(
+    `##\\s*${escapedTitle}\\s*\\n([\\s\\S]*?)(?=\\n##\\s|$)`,
+    "i",
+  );
+  const match = markdown.match(pattern);
+  return match?.[1]?.trim() ?? "";
+}
+
+function extractBulletItems(sectionBody: string): string[] {
+  if (!sectionBody.trim()) return [];
+  return sectionBody
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("- "))
+    .map((line) => line.replace(/^-+\s*/, "").trim())
+    .filter(Boolean);
+}
+
+function normalizeTodoItems(items: string[]): string[] {
+  return items
+    .map((item) => item.replace(/^\[(?:x|X|\s)\]\s*/, "").trim())
+    .filter(Boolean);
+}
+
+function isPlaceholderItem(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized === "없음" ||
+    normalized === "none" ||
+    normalized === "n/a" ||
+    normalized === "-" ||
+    normalized === "na"
+  );
+}
+
+function normalizeCompareKey(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/\[[x\s]\]/g, "")
+    .replace(/[`*_~]/g, "")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+type ContextTaggedText = {
+  context: string;
+  text: string;
+};
+
+type ContextTaggedEvidence = SummaryEvidenceItem & {
+  context: string;
+};
+
+function normalizeContextName(value: string): string {
+  const cleaned = value
+    .replace(/[`*_~]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return DEFAULT_CONTEXT_NAME;
+  return cleaned.slice(0, 32);
+}
+
+function parseContextTaggedText(value: string): ContextTaggedText {
+  const text = value.trim();
+  if (!text) {
+    return { context: DEFAULT_CONTEXT_NAME, text: "" };
+  }
+
+  const matched = text.match(/^\[([^[\]]{1,40})\]\s*(.+)$/);
+  if (!matched) {
+    return { context: DEFAULT_CONTEXT_NAME, text };
+  }
+
+  return {
+    context: normalizeContextName(matched[1] ?? ""),
+    text: (matched[2] ?? "").trim(),
+  };
+}
+
+function dedupeContextTaggedItems(items: ContextTaggedText[]): ContextTaggedText[] {
+  const seen = new Set<string>();
+  const output: ContextTaggedText[] = [];
+
+  for (const item of items) {
+    const key = `${normalizeCompareKey(item.context)}|${normalizeCompareKey(item.text)}`;
+    if (!item.text || seen.has(key)) continue;
+    seen.add(key);
+    output.push(item);
+  }
+
+  return output;
+}
+
+function dedupeContextEvidenceItems(items: ContextTaggedEvidence[]): ContextTaggedEvidence[] {
+  const seen = new Set<string>();
+  const output: ContextTaggedEvidence[] = [];
+
+  for (const item of items) {
+    const key = [
+      normalizeCompareKey(item.context),
+      item.time.trim(),
+      item.source.trim().toLowerCase(),
+      normalizeCompareKey(item.text),
+    ].join("|");
+
+    if (!item.text.trim() || seen.has(key)) continue;
+    seen.add(key);
+    output.push(item);
+  }
+
+  return output;
+}
+
+function contextSortKey(value: string): string {
+  const key = normalizeCompareKey(value);
+  return key || normalizeCompareKey(DEFAULT_CONTEXT_NAME);
+}
+
+function getContextSummary(item: SummaryContextData): string {
+  return (
+    item.doneTodos[0] ??
+    item.workLogs[0] ??
+    item.issues[0] ??
+    "No details."
+  );
+}
+
+function parseEvidenceItems(items: string[]): SummaryEvidenceItem[] {
+  return items
+    .map((item) => {
+      const match = item.match(/^\[(.*?)\]\s*\[(.*?)\]\s*(.*)$/);
+      if (!match) {
+        return {
+          time: "",
+          source: "",
+          text: item.trim(),
+        };
+      }
+
+      return {
+        time: (match[1] ?? "").trim(),
+        source: (match[2] ?? "").trim(),
+        text: (match[3] ?? "").trim(),
+      };
+    })
+    .filter((item) => item.text.length > 0 && !isPlaceholderItem(item.text));
+}
+
+function dedupeTextList(items: string[]): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+
+  for (const item of items) {
+    const key = item.trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    output.push(key);
+  }
+
+  return output;
+}
+
+function cleanList(items: string[]): string[] {
+  return dedupeTextList(items.map((value) => value.trim()).filter(Boolean)).filter(
+    (item) => !isPlaceholderItem(item),
+  );
+}
+
+function dedupeEvidenceItems(items: SummaryEvidenceItem[]): SummaryEvidenceItem[] {
+  const seen = new Set<string>();
+  const output: SummaryEvidenceItem[] = [];
+
+  for (const item of items) {
+    const key = `${item.time}|${item.source}|${item.text}`;
+    if (!item.text.trim() || seen.has(key)) continue;
+    seen.add(key);
+    output.push(item);
+  }
+
+  return output;
+}
+
+function parseProviderSummaryData(
+  provider: PathProviderKey,
+  dateKey: string,
+  summary: string,
+): ProviderSummaryData {
+  const oneLineItems = extractBulletItems(extractSectionBody(summary, "한 줄 요약"));
+  const workLogs = extractBulletItems(extractSectionBody(summary, "오늘 한 일"));
+  const doneTodosRaw = extractBulletItems(extractSectionBody(summary, "완료한 TODO"));
+  const issues = extractBulletItems(extractSectionBody(summary, "이슈/메모"));
+  const evidenceRaw = extractBulletItems(extractSectionBody(summary, "근거 로그"));
+
+  return {
+    version: "1",
+    provider,
+    dateKey,
+    oneLineSummary: oneLineItems[0] ?? "",
+    doneTodos: cleanList(normalizeTodoItems(doneTodosRaw)),
+    workLogs: cleanList(workLogs),
+    issues: cleanList(issues),
+    evidence: dedupeEvidenceItems(parseEvidenceItems(evidenceRaw)),
+  };
+}
+
+function buildMergedSummaryData(
+  dateKey: string,
+  connectedProviders: string[],
+  providerResults: ProviderSummaryData[],
+): MergedSummaryData {
+  const oneLineList = dedupeTextList(
+    providerResults.map((item) => item.oneLineSummary).filter(Boolean),
+  );
+  const doneTagged = dedupeContextTaggedItems(
+    cleanList(providerResults.flatMap((item) => item.doneTodos))
+      .map(parseContextTaggedText)
+      .filter((item) => item.text.length > 0),
+  );
+  const doneTodos = dedupeTextList(doneTagged.map((item) => item.text));
+
+  const workLogTagged = dedupeContextTaggedItems(
+    cleanList(providerResults.flatMap((item) => item.workLogs))
+      .map(parseContextTaggedText)
+      .filter((item) => item.text.length > 0),
+  );
+  const issueTagged = dedupeContextTaggedItems(
+    cleanList(providerResults.flatMap((item) => item.issues))
+      .map(parseContextTaggedText)
+      .filter((item) => item.text.length > 0),
+  );
+
+  const evidenceTagged = dedupeContextEvidenceItems(
+    providerResults
+      .flatMap((item) => item.evidence)
+      .map((item) => {
+        const tagged = parseContextTaggedText(item.text);
+        return {
+          ...item,
+          context: tagged.context,
+          text: tagged.text,
+        };
+      })
+      .filter((item) => item.text.length > 0),
+  );
+
+  const contextMap = new Map<string, SummaryContextData>();
+  const getContextBucket = (name: string): SummaryContextData => {
+    const contextName = normalizeContextName(name);
+    const key = contextSortKey(contextName);
+    const existing = contextMap.get(key);
+    if (existing) return existing;
+    const created: SummaryContextData = {
+      name: contextName,
+      summary: "",
+      doneTodos: [],
+      workLogs: [],
+      issues: [],
+      evidence: [],
+    };
+    contextMap.set(key, created);
+    return created;
+  };
+
+  doneTagged.forEach((item) => {
+    getContextBucket(item.context).doneTodos.push(item.text);
+  });
+  workLogTagged.forEach((item) => {
+    getContextBucket(item.context).workLogs.push(item.text);
+  });
+  issueTagged.forEach((item) => {
+    getContextBucket(item.context).issues.push(item.text);
+  });
+  evidenceTagged.forEach((item) => {
+    getContextBucket(item.context).evidence.push({
+      time: item.time,
+      source: item.source,
+      text: item.text,
+    });
+  });
+
+  const contexts = Array.from(contextMap.values())
+    .map((context) => {
+      const normalized: SummaryContextData = {
+        ...context,
+        doneTodos: cleanList(context.doneTodos),
+        workLogs: cleanList(context.workLogs),
+        issues: cleanList(context.issues),
+        evidence: dedupeEvidenceItems(context.evidence),
+      };
+      normalized.summary = getContextSummary(normalized);
+      return normalized;
+    })
+    .filter((context) => {
+      return (
+        context.doneTodos.length > 0 ||
+        context.workLogs.length > 0 ||
+        context.issues.length > 0 ||
+        context.evidence.length > 0
+      );
+    })
+    .sort((a, b) => {
+      const aScore =
+        a.doneTodos.length +
+        a.workLogs.length +
+        a.issues.length +
+        a.evidence.length;
+      const bScore =
+        b.doneTodos.length +
+        b.workLogs.length +
+        b.issues.length +
+        b.evidence.length;
+      if (bScore !== aScore) return bScore - aScore;
+      return a.name.localeCompare(b.name);
+    });
+
+  return {
+    version: "1",
+    dateKey,
+    connectedProviders: dedupeTextList(connectedProviders),
+    dailySummary: oneLineList[0] ?? "오늘 작업 로그가 충분하지 않습니다.",
+    doneTodos,
+    workLogs: dedupeTextList(workLogTagged.map((item) => item.text)),
+    issues: dedupeTextList(issueTagged.map((item) => item.text)),
+    evidence: dedupeEvidenceItems(
+      evidenceTagged.map(({ time, source, text }) => ({ time, source, text })),
+    ),
+    contexts,
+  };
+}
+
+function hasRepoPushCompletionEvidence(conversation: string): boolean {
+  const normalized = conversation.toLowerCase();
+
+  return [
+    "to https://github.com",
+    "new branch",
+    "set up to track",
+    "everything up-to-date",
+    "repository created",
+    "gh repo create",
+    "main -> main",
+    "forced update",
+  ].some((token) => normalized.includes(token));
+}
+
+function isRepoPushTodoItem(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return [
+    "github",
+    "repo",
+    "repository",
+    "저장소",
+    "push",
+    "푸시",
+    "origin",
+    "main",
+  ].some((token) => normalized.includes(token));
+}
+
+function normalizeWrapUpTodoStatus(
+  summary: string,
+  conversation: string,
+): string {
+  if (!summary.trim() || !hasRepoPushCompletionEvidence(conversation)) {
+    return summary;
+  }
+
+  const lines = summary.split("\n");
+  const output: string[] = [];
+
+  for (const line of lines) {
+    const uncheckedMatch = line.match(/^(\s*-\s)\[\s\](\s+)(.*)$/);
+    if (!uncheckedMatch) {
+      output.push(line);
+      continue;
+    }
+
+    const itemText = (uncheckedMatch[3] ?? "").trim();
+    if (!isRepoPushTodoItem(itemText)) {
+      output.push(line);
+      continue;
+    }
+
+    const checkedLine = `${uncheckedMatch[1]}[x]${uncheckedMatch[2]}${itemText}`;
+    output.push(checkedLine);
+  }
+  return output.join("\n");
 }
 
 function resolveWrapUpCommand(
@@ -248,6 +644,32 @@ function normalizeProfile(profile: ProfileConfig): ProfileConfig {
     cursorRootPath: profile.cursorRootPath.trim(),
     geminiRootPath: profile.geminiRootPath.trim(),
   };
+}
+
+function recordDateKey(record: SummaryRecord): string {
+  if (record.dateKey && record.dateKey.trim()) return record.dateKey;
+  return toLocalDateKey(record.createdAt);
+}
+
+function upsertRecordByDate(
+  prev: SummaryRecord[],
+  nextRecord: SummaryRecord,
+): SummaryRecord[] {
+  const nextDateKey = recordDateKey(nextRecord);
+  const normalizedNext = {
+    ...nextRecord,
+    dateKey: nextDateKey,
+  };
+
+  return [normalizedNext, ...prev]
+    .filter((item, index, array) => {
+      const currentDateKey = recordDateKey(item);
+      const firstIndex = array.findIndex(
+        (candidate) => recordDateKey(candidate) === currentDateKey,
+      );
+      return firstIndex === index;
+    })
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
 function App() {
@@ -455,18 +877,18 @@ function App() {
         summary = createLocalSummary(effectiveConversation);
       }
 
+      const createdAt = new Date().toISOString();
       const record: SummaryRecord = {
         id: `${Date.now()}`,
-        createdAt: new Date().toISOString(),
+        createdAt,
         provider,
         summary,
         conversation: effectiveConversation,
+        dateKey: toLocalDateKey(createdAt),
       };
 
       await saveRecord(record);
-      setRecords((prev) =>
-        [record, ...prev].sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
-      );
+      setRecords((prev) => upsertRecordByDate(prev, record));
 
       setConversationInput("");
 
@@ -556,8 +978,11 @@ function App() {
       );
 
       const sections: string[] = [];
+      const providerResults: ProviderSummaryData[] = [];
       let usedTerminal = false;
       let usedFallback = false;
+      const createdAt = new Date().toISOString();
+      const dateKey = toLocalDateKey(createdAt);
 
       for (const provider of runnableProviders) {
         const sourceConversation =
@@ -599,6 +1024,14 @@ function App() {
           );
         }
 
+        providerSummary = normalizeWrapUpTodoStatus(
+          providerSummary,
+          sourceConversation,
+        );
+        providerResults.push(
+          parseProviderSummaryData(provider, dateKey, providerSummary),
+        );
+
         sections.push(`## ${PROVIDER_LABEL[provider]}\n${providerSummary.trim()}`);
       }
 
@@ -611,24 +1044,32 @@ function App() {
         "",
         ...sections,
       ].join("\n");
+      const merged = buildMergedSummaryData(
+        dateKey,
+        runnableProviders.map((provider) => PROVIDER_LABEL[provider]),
+        providerResults,
+      );
 
       const record: SummaryRecord = {
         id: `${Date.now()}`,
-        createdAt: new Date().toISOString(),
+        createdAt,
         provider: usedTerminal ? "terminal" : "local",
         summary,
         conversation: collectedConversation,
+        dateKey,
+        providerResults,
+        merged,
       };
 
       await saveRecord(record);
-      const dateKey = toLocalDateKey(record.createdAt);
+      const savedDateKey = toLocalDateKey(record.createdAt);
       appendWrapUpLog(
         "ok",
-        `Saved summary to ~/.briefly/records/${dateKey}/summary.md`,
+        `Saved summary to ~/.briefly/records/${savedDateKey}/summary.md`,
       );
       appendWrapUpLog("ok", "Wrap-up completed.");
       setRecords((prev) =>
-        [record, ...prev].sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+        upsertRecordByDate(prev, record),
       );
 
       setFeedbackTone(usedFallback ? "error" : "normal");

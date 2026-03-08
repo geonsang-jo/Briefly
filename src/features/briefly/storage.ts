@@ -10,7 +10,9 @@ import {
   requestSaveRecordToFs,
 } from "@/features/briefly/services";
 import type {
+  MergedSummaryData,
   ProfileConfig,
+  ProviderSummaryData,
   SummaryRecord,
   SummaryRecordFile,
 } from "@/features/briefly/types";
@@ -59,6 +61,88 @@ function loadProfileFromLocalStorage(): ProfileConfig | null {
   return normalizeProfile(raw);
 }
 
+function toDateKeyFromIso(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso.slice(0, 10);
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function effectiveDateKey(item: SummaryRecord): string {
+  if (item.dateKey && item.dateKey.trim()) return item.dateKey;
+  return toDateKeyFromIso(item.createdAt);
+}
+
+function normalizeMergedSummary(
+  value: unknown,
+): MergedSummaryData | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = value as Partial<MergedSummaryData>;
+  const contexts = Array.isArray(candidate.contexts) ? candidate.contexts : [];
+
+  return {
+    version: candidate.version === "1" ? "1" : "1",
+    dateKey: typeof candidate.dateKey === "string" ? candidate.dateKey : "",
+    connectedProviders: Array.isArray(candidate.connectedProviders)
+      ? candidate.connectedProviders.filter(
+          (item): item is string => typeof item === "string",
+        )
+      : [],
+    dailySummary:
+      typeof candidate.dailySummary === "string" ? candidate.dailySummary : "",
+    doneTodos: Array.isArray(candidate.doneTodos)
+      ? candidate.doneTodos.filter((item): item is string => typeof item === "string")
+      : [],
+    workLogs: Array.isArray(candidate.workLogs)
+      ? candidate.workLogs.filter((item): item is string => typeof item === "string")
+      : [],
+    issues: Array.isArray(candidate.issues)
+      ? candidate.issues.filter((item): item is string => typeof item === "string")
+      : [],
+    evidence: Array.isArray(candidate.evidence)
+      ? candidate.evidence.filter(
+          (item): item is { time: string; source: string; text: string } =>
+            Boolean(
+              item &&
+                typeof item === "object" &&
+                typeof item.time === "string" &&
+                typeof item.source === "string" &&
+                typeof item.text === "string",
+            ),
+        )
+      : [],
+    contexts: contexts
+      .filter((item): item is MergedSummaryData["contexts"][number] => Boolean(item && typeof item === "object"))
+      .map((item) => ({
+        name: typeof item.name === "string" ? item.name : "General",
+        summary: typeof item.summary === "string" ? item.summary : "",
+        doneTodos: Array.isArray(item.doneTodos)
+          ? item.doneTodos.filter((entry): entry is string => typeof entry === "string")
+          : [],
+        workLogs: Array.isArray(item.workLogs)
+          ? item.workLogs.filter((entry): entry is string => typeof entry === "string")
+          : [],
+        issues: Array.isArray(item.issues)
+          ? item.issues.filter((entry): entry is string => typeof entry === "string")
+          : [],
+        evidence: Array.isArray(item.evidence)
+          ? item.evidence.filter(
+              (entry): entry is { time: string; source: string; text: string } =>
+                Boolean(
+                  entry &&
+                    typeof entry === "object" &&
+                    typeof entry.time === "string" &&
+                    typeof entry.source === "string" &&
+                    typeof entry.text === "string",
+                ),
+            )
+          : [],
+      })),
+  };
+}
+
 function normalizeRecord(
   item: Partial<SummaryRecord> &
     Partial<SummaryRecordFile> & { provider?: string | null },
@@ -76,7 +160,11 @@ function normalizeRecord(
   const dateKey =
     typeof item.dateKey === "string" && item.dateKey.trim()
       ? item.dateKey
-      : undefined;
+      : toDateKeyFromIso(item.createdAt);
+  const providerResults = Array.isArray(item.providerResults)
+    ? (item.providerResults as ProviderSummaryData[])
+    : undefined;
+  const merged = normalizeMergedSummary(item.merged);
 
   return {
     id: item.id,
@@ -85,6 +173,8 @@ function normalizeRecord(
     summary: item.summary,
     conversation,
     dateKey,
+    providerResults,
+    merged,
   };
 }
 
@@ -95,14 +185,28 @@ function loadRecordsFromLocalStorage(): SummaryRecord[] {
   return raw
     .map((item) => normalizeRecord(item))
     .filter((item): item is SummaryRecord => Boolean(item))
+    .filter((item, index, array) => {
+      const key = effectiveDateKey(item);
+      const firstIndex = array.findIndex(
+        (candidate) => effectiveDateKey(candidate) === key,
+      );
+      return firstIndex === index;
+    })
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
 function appendRecordToLocalStorage(record: SummaryRecord): void {
   const current = loadRecordsFromLocalStorage();
-  const next = [record, ...current]
+  const nextRecord = {
+    ...record,
+    dateKey: effectiveDateKey(record),
+  };
+  const next = [nextRecord, ...current]
     .filter((item, index, array) => {
-      const firstIndex = array.findIndex((candidate) => candidate.id === item.id);
+      const key = effectiveDateKey(item);
+      const firstIndex = array.findIndex(
+        (candidate) => effectiveDateKey(candidate) === key,
+      );
       return firstIndex === index;
     })
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -162,6 +266,8 @@ export async function loadRecords(): Promise<SummaryRecord[]> {
         provider: record.provider,
         summary: record.summary,
         dateKey,
+        providerResults: record.providerResults,
+        merged: record.merged,
       });
     }
   } catch {
@@ -181,10 +287,7 @@ export async function saveProfile(profile: ProfileConfig): Promise<void> {
 }
 
 export async function saveRecord(record: SummaryRecord): Promise<void> {
-  const date = new Date(record.createdAt);
-  const dateKey = Number.isNaN(date.getTime())
-    ? record.createdAt.slice(0, 10)
-    : `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  const dateKey = effectiveDateKey(record);
 
   try {
     await requestSaveRecordToFs({
@@ -193,6 +296,8 @@ export async function saveRecord(record: SummaryRecord): Promise<void> {
       provider: record.provider,
       summary: record.summary,
       dateKey,
+      providerResults: record.providerResults,
+      merged: record.merged,
     });
     return;
   } catch {

@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate};
+use chrono::{DateTime, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -65,6 +65,53 @@ struct FsRecordMeta {
     date_key: String,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SummaryEvidenceItem {
+    time: String,
+    source: String,
+    text: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SummaryContextData {
+    name: String,
+    summary: String,
+    done_todos: Vec<String>,
+    work_logs: Vec<String>,
+    issues: Vec<String>,
+    evidence: Vec<SummaryEvidenceItem>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ProviderSummaryData {
+    version: String,
+    provider: String,
+    date_key: String,
+    one_line_summary: String,
+    done_todos: Vec<String>,
+    work_logs: Vec<String>,
+    issues: Vec<String>,
+    evidence: Vec<SummaryEvidenceItem>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct MergedSummaryData {
+    version: String,
+    date_key: String,
+    connected_providers: Vec<String>,
+    daily_summary: String,
+    done_todos: Vec<String>,
+    work_logs: Vec<String>,
+    issues: Vec<String>,
+    evidence: Vec<SummaryEvidenceItem>,
+    #[serde(default)]
+    contexts: Vec<SummaryContextData>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FsRecordItem {
@@ -73,6 +120,8 @@ struct FsRecordItem {
     provider: String,
     date_key: String,
     summary: String,
+    provider_results: Option<Vec<ProviderSummaryData>>,
+    merged: Option<MergedSummaryData>,
 }
 
 #[derive(Deserialize)]
@@ -83,6 +132,8 @@ struct SaveRecordInput {
     provider: String,
     date_key: Option<String>,
     summary: String,
+    provider_results: Option<Vec<ProviderSummaryData>>,
+    merged: Option<MergedSummaryData>,
 }
 
 struct CollectedMessage {
@@ -197,40 +248,20 @@ fn extract_text(value: &Value, max_len: usize) -> String {
     compact_text(&chunks.join("\n"), max_len)
 }
 
-fn collect_codex_session_files(codex_root: &Path, today: NaiveDate) -> Vec<PathBuf> {
+fn collect_codex_session_files(codex_root: &Path) -> Vec<PathBuf> {
     let sessions_root = codex_root.join("sessions");
-    let mut files = Vec::new();
-
-    for day_offset in 0..=1 {
-        let target_date = today - Duration::days(day_offset);
-        let dir = sessions_root
-            .join(format!("{:04}", target_date.year()))
-            .join(format!("{:02}", target_date.month()))
-            .join(format!("{:02}", target_date.day()));
-
-        if !dir.exists() {
-            continue;
-        }
-
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let is_jsonl = path
-                .extension()
-                .and_then(|value| value.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("jsonl"))
-                .unwrap_or(false);
-            if is_jsonl {
-                files.push(path);
-            }
-        }
+    if !sessions_root.exists() || !sessions_root.is_dir() {
+        return Vec::new();
     }
 
-    files
+    // Codex app can keep appending today's messages to a session file that was
+    // originally created days ago. We therefore select recent files by mtime
+    // instead of only scanning today's directory.
+    let modified_after = SystemTime::now()
+        .checked_sub(StdDuration::from_secs(60 * 60 * 72))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+
+    collect_recent_jsonl_files(&sessions_root, modified_after, 260)
 }
 
 fn resolve_codex_root(home_dir: &Path, custom_root: Option<String>) -> PathBuf {
@@ -478,6 +509,27 @@ fn summary_markdown(date_key: &str, provider: &str, created_at: &str, summary: &
     )
 }
 
+fn provider_file_stem(provider: &str) -> String {
+    let normalized = provider
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+
+    if normalized.is_empty() {
+        "unknown".to_string()
+    } else {
+        normalized
+    }
+}
+
 fn contains_jsonl_file(root: &Path, max_dirs: usize, max_entries_per_dir: usize) -> bool {
     if !root.exists() || !root.is_dir() {
         return false;
@@ -583,16 +635,13 @@ fn collect_codex_messages(
         .map_err(|err| format!("Failed to open codex session file {}: {err}", file_path.display()))?;
     let reader = BufReader::new(file);
     let mut skip_wrap_up_assistant = false;
+    let mut seen = HashSet::new();
 
     for line in reader.lines().flatten() {
         let record: Value = match serde_json::from_str(&line) {
             Ok(record) => record,
             Err(_) => continue,
         };
-
-        if record.get("type").and_then(Value::as_str) != Some("event_msg") {
-            continue;
-        }
 
         let timestamp = match record.get("timestamp").and_then(Value::as_str) {
             Some(timestamp) if parse_rfc3339_to_local_date(timestamp) == Some(today) => timestamp,
@@ -603,23 +652,43 @@ fn collect_codex_messages(
             Some(payload) => payload,
             None => continue,
         };
-        let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or_default();
+        let record_type = record.get("type").and_then(Value::as_str).unwrap_or_default();
 
-        if payload_type == "task_complete" && skip_wrap_up_assistant {
-            skip_wrap_up_assistant = false;
+        let (role, text) = if record_type == "event_msg" {
+            let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or_default();
+
+            if payload_type == "task_complete" && skip_wrap_up_assistant {
+                skip_wrap_up_assistant = false;
+                continue;
+            }
+
+            match payload_type {
+                "user_message" => (
+                    "user",
+                    compact_text(payload.get("message").and_then(Value::as_str).unwrap_or_default(), 1500),
+                ),
+                "agent_message" => (
+                    "assistant",
+                    compact_text(payload.get("message").and_then(Value::as_str).unwrap_or_default(), 1500),
+                ),
+                _ => continue,
+            }
+        } else if record_type == "response_item" {
+            let item_type = payload.get("type").and_then(Value::as_str).unwrap_or_default();
+            if item_type != "message" {
+                continue;
+            }
+
+            let role = match payload.get("role").and_then(Value::as_str) {
+                Some("user") => "user",
+                Some("assistant") => "assistant",
+                _ => continue,
+            };
+
+            let text = extract_text(payload.get("content").unwrap_or(&Value::Null), 1500);
+            (role, text)
+        } else {
             continue;
-        }
-
-        let (role, text) = match payload_type {
-            "user_message" => (
-                "user",
-                compact_text(payload.get("message").and_then(Value::as_str).unwrap_or_default(), 1500),
-            ),
-            "agent_message" => (
-                "assistant",
-                compact_text(payload.get("message").and_then(Value::as_str).unwrap_or_default(), 1500),
-            ),
-            _ => continue,
         };
 
         if text.is_empty() {
@@ -633,6 +702,11 @@ fn collect_codex_messages(
             }
             skip_wrap_up_assistant = false;
         } else if skip_wrap_up_assistant || is_wrap_up_generated_text(&text) {
+            continue;
+        }
+
+        let dedupe_key = format!("{timestamp}|{role}|{text}");
+        if !seen.insert(dedupe_key) {
             continue;
         }
 
@@ -825,7 +899,7 @@ async fn collect_today_terminal_conversation(
         let mut messages = Vec::new();
 
         let codex_root = resolve_codex_root(home_dir, codex_root_path);
-        let codex_files = collect_codex_session_files(&codex_root, today);
+        let codex_files = collect_codex_session_files(&codex_root);
         for file_path in codex_files {
             let _ = collect_codex_messages(&file_path, today, &mut messages);
         }
@@ -1010,12 +1084,11 @@ async fn list_records_from_fs() -> Result<Vec<FsRecordItem>, String> {
                 Err(_) => continue,
             };
 
-            let summary_raw = match fs::read_to_string(&summary_path) {
-                Ok(content) => content,
-                Err(_) => continue,
+            let summary = match fs::read_to_string(&summary_path) {
+                Ok(content) => strip_markdown_front_matter(&content),
+                Err(_) => String::new(),
             };
-            let summary = strip_markdown_front_matter(&summary_raw);
-            if meta.id.trim().is_empty() || meta.created_at.trim().is_empty() || summary.is_empty() {
+            if meta.id.trim().is_empty() || meta.created_at.trim().is_empty() {
                 continue;
             }
 
@@ -1023,12 +1096,65 @@ async fn list_records_from_fs() -> Result<Vec<FsRecordItem>, String> {
                 .or_else(|| parse_date_key(&fallback_date_key))
                 .unwrap_or_else(|| date_key_from_created_at(&meta.created_at));
 
+            let merged_path = date_dir.join("merged.json");
+            let merged = fs::read_to_string(&merged_path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<MergedSummaryData>(&raw).ok());
+
+            let providers_dir = date_dir.join("providers");
+            let mut provider_results: Vec<ProviderSummaryData> = Vec::new();
+            if providers_dir.exists() && providers_dir.is_dir() {
+                if let Ok(provider_entries) = fs::read_dir(&providers_dir) {
+                    for provider_entry in provider_entries.flatten() {
+                        let provider_path = provider_entry.path();
+                        let is_json = provider_path
+                            .extension()
+                            .and_then(|value| value.to_str())
+                            .map(|ext| ext.eq_ignore_ascii_case("json"))
+                            .unwrap_or(false);
+                        if !is_json {
+                            continue;
+                        }
+
+                        let provider_raw = match fs::read_to_string(&provider_path) {
+                            Ok(content) => content,
+                            Err(_) => continue,
+                        };
+                        let parsed = match serde_json::from_str::<ProviderSummaryData>(&provider_raw) {
+                            Ok(data) => data,
+                            Err(_) => continue,
+                        };
+                        provider_results.push(parsed);
+                    }
+                }
+            }
+            provider_results.sort_by(|a, b| a.provider.cmp(&b.provider));
+
+            let effective_summary = if summary.is_empty() {
+                merged
+                    .as_ref()
+                    .map(|value| value.daily_summary.trim().to_string())
+                    .unwrap_or_default()
+            } else {
+                summary
+            };
+
+            if effective_summary.trim().is_empty() {
+                continue;
+            }
+
             items.push(FsRecordItem {
                 id: meta.id,
                 created_at: meta.created_at,
                 provider: normalize_provider(&meta.provider),
                 date_key,
-                summary,
+                summary: effective_summary,
+                provider_results: if provider_results.is_empty() {
+                    None
+                } else {
+                    Some(provider_results)
+                },
+                merged,
             });
         }
 
@@ -1080,6 +1206,45 @@ async fn save_record_to_fs(record: SaveRecordInput) -> Result<(), String> {
 
         let summary_md = summary_markdown(&date_key, &provider, &created_at, &record.summary);
         atomic_write(&record_dir.join("summary.md"), summary_md.as_bytes())?;
+
+        let providers_dir = record_dir.join("providers");
+        if providers_dir.exists() {
+            fs::remove_dir_all(&providers_dir).map_err(|err| {
+                format!(
+                    "Failed to clear providers dir {}: {err}",
+                    providers_dir.display()
+                )
+            })?;
+        }
+
+        if let Some(provider_results) = record.provider_results {
+            if !provider_results.is_empty() {
+                fs::create_dir_all(&providers_dir).map_err(|err| {
+                    format!(
+                        "Failed to create providers dir {}: {err}",
+                        providers_dir.display()
+                    )
+                })?;
+
+                for item in provider_results {
+                    let file_name = format!("{}.json", provider_file_stem(&item.provider));
+                    let file_path = providers_dir.join(file_name);
+                    let content = serde_json::to_vec_pretty(&item)
+                        .map_err(|err| format!("Failed to serialize provider result: {err}"))?;
+                    atomic_write(&file_path, &content)?;
+                }
+            }
+        }
+
+        let merged_path = record_dir.join("merged.json");
+        if let Some(merged) = record.merged {
+            let merged_content = serde_json::to_vec_pretty(&merged)
+                .map_err(|err| format!("Failed to serialize merged summary: {err}"))?;
+            atomic_write(&merged_path, &merged_content)?;
+        } else if merged_path.exists() {
+            fs::remove_file(&merged_path)
+                .map_err(|err| format!("Failed to remove merged file {}: {err}", merged_path.display()))?;
+        }
         Ok(())
     })
     .await
