@@ -13,10 +13,15 @@ import { Input } from "@/components/ui/input";
 import { Meteors } from "@/components/ui/meteors";
 import { taskSchema } from "@/components/tasks/data/schema";
 import tasksSeedData from "@/components/tasks/data/tasks.json";
-import type { ProfileConfig, SummaryRecord } from "@/features/briefly/types";
+import type {
+  ProfileConfig,
+  SummaryEvidenceItem,
+  SummaryRecord,
+} from "@/features/briefly/types";
 
 type DailyTaskStatus = "todo" | "done";
 type HomeContentMode = "task" | "record";
+type RecordRangeMode = "day" | "week" | "month";
 
 type DailyTask = {
   id: string;
@@ -34,6 +39,25 @@ type UserTask = {
   priority: "low" | "medium" | "high";
 };
 
+type AggregatedContextRecord = {
+  name: string;
+  summary: string;
+  doneTodos: string[];
+  workLogs: string[];
+  issues: string[];
+  evidence: SummaryEvidenceItem[];
+};
+
+type AggregatedRecordView = {
+  summary: string;
+  connectedProviders: string[];
+  doneTodos: string[];
+  workLogs: string[];
+  issues: string[];
+  evidence: SummaryEvidenceItem[];
+  contexts: AggregatedContextRecord[];
+};
+
 const USER_TASKS_STORAGE_KEY = "briefly.daily-user-tasks.v1";
 
 const WEEKDAY_SHORT = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"] as const;
@@ -47,11 +71,191 @@ function toDateKey(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
+function parseDateKey(dateKey: string): Date | null {
+  const [yearRaw, monthRaw, dayRaw] = dateKey.split("-");
+  const year = Number(yearRaw);
+  const month = Number(monthRaw);
+  const day = Number(dayRaw);
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) {
+    return null;
+  }
+  const parsed = new Date(year, month - 1, day);
+  parsed.setHours(0, 0, 0, 0);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
 function shiftDate(date: Date, offsetDays: number): Date {
   const result = new Date(date);
   result.setHours(0, 0, 0, 0);
   result.setDate(result.getDate() + offsetDays);
   return result;
+}
+
+function startOfWeek(date: Date): Date {
+  const base = new Date(date);
+  base.setHours(0, 0, 0, 0);
+  base.setDate(base.getDate() - base.getDay());
+  return base;
+}
+
+function endOfWeek(date: Date): Date {
+  return shiftDate(startOfWeek(date), 6);
+}
+
+function normalizeCompareKey(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function dedupeText(items: string[]): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+
+  for (const item of items) {
+    const trimmed = item.trim();
+    if (!trimmed) continue;
+    const key = normalizeCompareKey(trimmed);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    output.push(trimmed);
+  }
+
+  return output;
+}
+
+function dedupeEvidence(items: SummaryEvidenceItem[]): SummaryEvidenceItem[] {
+  const seen = new Set<string>();
+  const output: SummaryEvidenceItem[] = [];
+
+  for (const item of items) {
+    const key = `${item.time.trim()}|${item.source.trim().toLowerCase()}|${normalizeCompareKey(item.text)}`;
+    if (!item.text.trim() || seen.has(key)) continue;
+    seen.add(key);
+    output.push(item);
+  }
+
+  return output;
+}
+
+function aggregateRecordsByRange(records: SummaryRecord[]): AggregatedRecordView {
+  const summaryCandidates: string[] = [];
+  const providerSet = new Set<string>();
+  const doneTodos: string[] = [];
+  const workLogs: string[] = [];
+  const issues: string[] = [];
+  const evidence: SummaryEvidenceItem[] = [];
+  const contextMap = new Map<string, AggregatedContextRecord>();
+
+  const getContextBucket = (name: string): AggregatedContextRecord => {
+    const safeName = name.trim() || "General";
+    const key = normalizeCompareKey(safeName) || "general";
+    const existing = contextMap.get(key);
+    if (existing) return existing;
+    const created: AggregatedContextRecord = {
+      name: safeName,
+      summary: "",
+      doneTodos: [],
+      workLogs: [],
+      issues: [],
+      evidence: [],
+    };
+    contextMap.set(key, created);
+    return created;
+  };
+
+  records.forEach((record) => {
+    const merged = record.merged;
+    if (!merged) return;
+
+    if (merged.dailySummary?.trim()) {
+      summaryCandidates.push(merged.dailySummary.trim());
+    }
+    merged.connectedProviders.forEach((provider) => {
+      if (provider.trim()) providerSet.add(provider.trim());
+    });
+
+    doneTodos.push(...merged.doneTodos);
+    workLogs.push(...merged.workLogs);
+    issues.push(...merged.issues);
+    evidence.push(...merged.evidence);
+
+    if (merged.contexts.length > 0) {
+      merged.contexts.forEach((context) => {
+        const bucket = getContextBucket(context.name);
+        bucket.doneTodos.push(...context.doneTodos);
+        bucket.workLogs.push(...context.workLogs);
+        bucket.issues.push(...context.issues);
+        bucket.evidence.push(...context.evidence);
+      });
+      return;
+    }
+
+    const fallback = getContextBucket("General");
+    fallback.doneTodos.push(...merged.doneTodos);
+    fallback.workLogs.push(...merged.workLogs);
+    fallback.issues.push(...merged.issues);
+    fallback.evidence.push(...merged.evidence);
+  });
+
+  const normalizedDone = dedupeText(doneTodos);
+  const normalizedLogs = dedupeText(workLogs);
+  const normalizedIssues = dedupeText(issues);
+  const normalizedEvidence = dedupeEvidence(evidence);
+
+  const contexts = Array.from(contextMap.values())
+    .map((context) => {
+      const normalizedContext: AggregatedContextRecord = {
+        ...context,
+        doneTodos: dedupeText(context.doneTodos),
+        workLogs: dedupeText(context.workLogs),
+        issues: dedupeText(context.issues),
+        evidence: dedupeEvidence(context.evidence),
+        summary: "",
+      };
+      normalizedContext.summary =
+        normalizedContext.doneTodos[0] ??
+        normalizedContext.workLogs[0] ??
+        normalizedContext.issues[0] ??
+        normalizedContext.evidence[0]?.text ??
+        "상세 작업 없음";
+      return normalizedContext;
+    })
+    .filter((context) => {
+      return (
+        context.doneTodos.length > 0 ||
+        context.workLogs.length > 0 ||
+        context.issues.length > 0 ||
+        context.evidence.length > 0
+      );
+    })
+    .sort((a, b) => {
+      const aScore =
+        a.doneTodos.length + a.workLogs.length + a.issues.length + a.evidence.length;
+      const bScore =
+        b.doneTodos.length + b.workLogs.length + b.issues.length + b.evidence.length;
+      if (bScore !== aScore) return bScore - aScore;
+      return a.name.localeCompare(b.name);
+    });
+
+  const summary = (() => {
+    const unique = dedupeText(summaryCandidates);
+    if (unique.length === 1) return unique[0];
+    if (unique.length > 1) return `${records.length}개 기록을 통합한 업무 요약입니다.`;
+    return "선택한 기간에 구조화된 요약이 없습니다.";
+  })();
+
+  return {
+    summary,
+    connectedProviders: Array.from(providerSet.values()),
+    doneTodos: normalizedDone,
+    workLogs: normalizedLogs,
+    issues: normalizedIssues,
+    evidence: normalizedEvidence,
+    contexts,
+  };
 }
 
 function loadUserTasks(): UserTask[] {
@@ -136,6 +340,7 @@ export function HomeView({
   const [newTaskTitle, setNewTaskTitle] = useState("");
   const [newTaskPriority, setNewTaskPriority] = useState<DailyTask["priority"]>("medium");
   const [contentMode, setContentMode] = useState<HomeContentMode>("task");
+  const [recordRangeMode, setRecordRangeMode] = useState<RecordRangeMode>("day");
 
   const [userTasks, setUserTasks] = useState<UserTask[]>(() => loadUserTasks());
   const [statusByTaskId, setStatusByTaskId] = useState<Record<string, DailyTaskStatus>>({});
@@ -203,10 +408,84 @@ export function HomeView({
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }, [selectedDateKey, sortedRecords]);
 
+  const dateKeysWithContent = useMemo(() => {
+    const keys = new Set<string>();
+    allTasks.forEach((task) => {
+      if (task.dateKey.trim()) keys.add(task.dateKey);
+    });
+    sortedRecords.forEach((record) => {
+      const key = recordDateKey(record);
+      if (key.trim()) keys.add(key);
+    });
+    return keys;
+  }, [allTasks, sortedRecords]);
+
+  const selectedWeekRecords = useMemo(() => {
+    const start = startOfWeek(selectedDate);
+    const end = endOfWeek(selectedDate);
+    const startTs = start.getTime();
+    const endTs = end.getTime();
+
+    return sortedRecords
+      .filter((record) => {
+        const parsed = parseDateKey(recordDateKey(record));
+        if (!parsed) return false;
+        const ts = parsed.getTime();
+        return ts >= startTs && ts <= endTs;
+      })
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }, [selectedDate, sortedRecords]);
+
+  const selectedMonthRecords = useMemo(() => {
+    const year = selectedDate.getFullYear();
+    const month = selectedDate.getMonth();
+
+    return sortedRecords
+      .filter((record) => {
+        const parsed = parseDateKey(recordDateKey(record));
+        if (!parsed) return false;
+        return (
+          parsed.getFullYear() === year &&
+          parsed.getMonth() === month
+        );
+      })
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }, [selectedDate, sortedRecords]);
+
+  const activeRecordList = useMemo(() => {
+    if (recordRangeMode === "week") return selectedWeekRecords;
+    if (recordRangeMode === "month") return selectedMonthRecords;
+    return selectedDayRecords;
+  }, [recordRangeMode, selectedDayRecords, selectedMonthRecords, selectedWeekRecords]);
+
+  const aggregatedRecord = useMemo(() => {
+    return aggregateRecordsByRange(activeRecordList);
+  }, [activeRecordList]);
+
   const selectedDateNum = String(selectedDate.getDate()).padStart(2, "0");
   const selectedMonthDay = `${selectedDate.toLocaleDateString("en-US", {
     month: "long",
   })} ${selectedDateNum}`;
+  const weekStartDate = startOfWeek(selectedDate);
+  const weekEndDate = endOfWeek(selectedDate);
+  const recordRangeLabel = useMemo(() => {
+    if (recordRangeMode === "day") {
+      return `Records for ${selectedMonthDay}`;
+    }
+    if (recordRangeMode === "week") {
+      const startText = `${weekStartDate.toLocaleDateString("en-US", { month: "short" })} ${String(
+        weekStartDate.getDate(),
+      ).padStart(2, "0")}`;
+      const endText = `${weekEndDate.toLocaleDateString("en-US", { month: "short" })} ${String(
+        weekEndDate.getDate(),
+      ).padStart(2, "0")}`;
+      return `Weekly records (${startText} - ${endText})`;
+    }
+    return `Monthly records (${selectedDate.toLocaleDateString("en-US", {
+      month: "long",
+      year: "numeric",
+    })})`;
+  }, [recordRangeMode, selectedDate, selectedMonthDay, weekEndDate, weekStartDate]);
 
   function taskStatus(task: DailyTask): DailyTaskStatus {
     return statusByTaskId[task.id] ?? task.defaultStatus;
@@ -306,6 +585,7 @@ export function HomeView({
               const dateKey = toDateKey(date);
               const isSelected = dateKey === selectedDateKey;
               const isToday = dateKey === todayDateKey;
+              const hasContent = dateKeysWithContent.has(dateKey);
               const distance =
                 Math.abs(date.getTime() - selectedDate.getTime()) /
                 (24 * 60 * 60 * 1000);
@@ -332,13 +612,17 @@ export function HomeView({
                       : `${lowOpacityClass} hover:bg-zinc-50`
                   }`}
                 >
-                  {isToday && !isSelected && (
-                    <span className="absolute right-1.5 top-1.5 size-1.5 rounded-full bg-[#f35f4e]" />
-                  )}
                   <p
-                    className={`text-3xl font-semibold ${isSelected ? "text-zinc-900" : "text-zinc-400"}`}
+                    className={`flex items-start justify-center gap-1 text-3xl font-semibold ${isSelected ? "text-zinc-900" : "text-zinc-400"}`}
                   >
-                    {date.getDate()}
+                    <span>{date.getDate()}</span>
+                    {(isToday || (!isSelected && hasContent)) && (
+                      <span
+                        className={`mt-1 inline-block size-1.5 rounded-full ${
+                          isToday ? "bg-[#f35f4e]" : "bg-emerald-400"
+                        }`}
+                      />
+                    )}
                   </p>
                   <p
                     className={`text-sm font-semibold tracking-wide ${
@@ -392,7 +676,7 @@ export function HomeView({
         <p className="self-center text-xs text-zinc-500">
           {contentMode === "task"
             ? `${selectedDayTasks.length} tasks`
-            : `${selectedDayRecords.length} records`}
+            : `${activeRecordList.length} records`}
         </p>
       </div>
 
@@ -490,173 +774,190 @@ export function HomeView({
           </div>
         </>
       ) : (
-        <div className="rounded-xl border">
-          <div className="flex items-center justify-between border-b px-4 py-3">
-            <p className="text-sm font-medium text-zinc-600">
-              Records for {selectedMonthDay}
-            </p>
-            <p className="text-xs text-zinc-400">{selectedDayRecords.length} items</p>
+        <div className="space-y-3">
+          <div className="inline-flex w-fit rounded-lg bg-zinc-100 p-1">
+            <Button
+              type="button"
+              variant={recordRangeMode === "day" ? "default" : "ghost"}
+              size="sm"
+              className="h-8 px-4"
+              onClick={() => setRecordRangeMode("day")}
+            >
+              Day
+            </Button>
+            <Button
+              type="button"
+              variant={recordRangeMode === "week" ? "default" : "ghost"}
+              size="sm"
+              className="h-8 px-4"
+              onClick={() => setRecordRangeMode("week")}
+            >
+              Week
+            </Button>
+            <Button
+              type="button"
+              variant={recordRangeMode === "month" ? "default" : "ghost"}
+              size="sm"
+              className="h-8 px-4"
+              onClick={() => setRecordRangeMode("month")}
+            >
+              Month
+            </Button>
           </div>
 
-          {selectedDayRecords.length > 0 ? (
-            <ul className="space-y-3 px-4 py-4">
-              {selectedDayRecords.map((record) => (
-                <li key={record.id} className="rounded-lg border bg-background p-4">
-                  <div className="mb-3 flex items-center justify-between gap-3">
-                    <p className="text-xs text-zinc-500">{formatDateTime(record.createdAt)}</p>
-                    <Badge
-                      variant="outline"
-                      className={`text-[11px] uppercase ${
-                        record.provider === "terminal"
-                          ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                          : "border-zinc-200 bg-zinc-50 text-zinc-600"
-                      }`}
-                    >
-                      {record.provider}
+          <div className="rounded-xl border">
+            <div className="flex items-center justify-between border-b px-4 py-3">
+              <p className="text-sm font-medium text-zinc-600">{recordRangeLabel}</p>
+              <p className="text-xs text-zinc-400">{activeRecordList.length} items</p>
+            </div>
+
+            {activeRecordList.length > 0 ? (
+              <div className="space-y-3 px-4 py-4">
+                <section className="rounded-lg bg-zinc-50 p-3">
+                  <p className="text-xs font-medium text-zinc-500">Summary</p>
+                  <p className="mt-1 text-sm font-medium text-zinc-900">
+                    {aggregatedRecord.summary}
+                  </p>
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    <Badge variant="secondary" className="text-[11px]">
+                      Done {aggregatedRecord.doneTodos.length}
+                    </Badge>
+                    <Badge variant="secondary" className="text-[11px]">
+                      Logs {aggregatedRecord.workLogs.length}
+                    </Badge>
+                    <Badge variant="secondary" className="text-[11px]">
+                      Issues {aggregatedRecord.issues.length}
                     </Badge>
                   </div>
-                  {record.merged ? (
-                    <div className="space-y-4">
-                      <div className="rounded-lg bg-zinc-50 p-3">
-                        <p className="text-xs font-medium text-zinc-500">Daily Summary</p>
-                        <p className="mt-1 text-sm font-medium text-zinc-900">
-                          {record.merged.dailySummary || "요약 없음"}
-                        </p>
-                        {record.merged.connectedProviders.length > 0 && (
-                          <div className="mt-2 flex flex-wrap gap-1.5">
-                            {record.merged.connectedProviders.map((provider) => (
-                              <Badge key={provider} variant="secondary" className="text-[11px]">
-                                {provider}
+                  {aggregatedRecord.connectedProviders.length > 0 && (
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      {aggregatedRecord.connectedProviders.map((provider) => (
+                        <Badge key={provider} variant="outline" className="text-[11px]">
+                          {provider}
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
+                </section>
+
+                {aggregatedRecord.contexts.length > 0 && (
+                  <Accordion type="multiple" className="rounded-lg border px-3">
+                    {aggregatedRecord.contexts.map((context) => (
+                      <AccordionItem key={context.name} value={context.name} className="border-zinc-200">
+                        <AccordionTrigger className="py-3">
+                          <div className="min-w-0 text-left">
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-semibold text-zinc-900">{context.name}</span>
+                              <Badge variant="secondary" className="text-[11px]">
+                                {contextItemCount(context)} items
                               </Badge>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-
-                      {record.merged.contexts.length > 0 ? (
-                        <Accordion type="multiple" className="rounded-lg border px-3">
-                          {record.merged.contexts.map((context) => (
-                            <AccordionItem key={context.name} value={context.name} className="border-zinc-200">
-                              <AccordionTrigger className="py-3">
-                                <div className="min-w-0 text-left">
-                                  <div className="flex items-center gap-2">
-                                    <span className="text-sm font-semibold text-zinc-900">{context.name}</span>
-                                    <Badge variant="secondary" className="text-[11px]">
-                                      {contextItemCount(context)} items
-                                    </Badge>
-                                  </div>
-                                  <p className="mt-1 truncate text-xs text-zinc-500">
-                                    {context.summary || "No summary"}
-                                  </p>
-                                </div>
-                              </AccordionTrigger>
-                              <AccordionContent className="space-y-3">
-                                {context.doneTodos.length > 0 && (
-                                  <section className="rounded-lg bg-emerald-50/60 p-3">
-                                    <p className="mb-2 text-xs font-semibold tracking-wide text-emerald-700 uppercase">
-                                      Done
-                                    </p>
-                                    <ul className="space-y-1.5">
-                                      {context.doneTodos.map((todo) => (
-                                        <li key={todo} className="flex items-start gap-2 text-sm text-zinc-800">
-                                          <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-emerald-600" />
-                                          <span>{todo}</span>
-                                        </li>
-                                      ))}
-                                    </ul>
-                                  </section>
-                                )}
-
-                                {(context.workLogs.length > 0 || context.issues.length > 0) && (
-                                  <div className="grid gap-3 md:grid-cols-2">
-                                    {context.workLogs.length > 0 && (
-                                      <section className="rounded-lg bg-zinc-50 p-3">
-                                        <p className="mb-2 text-xs font-semibold tracking-wide text-zinc-500 uppercase">
-                                          Work Logs
-                                        </p>
-                                        <ul className="space-y-1">
-                                          {context.workLogs.map((log) => (
-                                            <li key={log} className="text-sm text-zinc-700">
-                                              - {log}
-                                            </li>
-                                          ))}
-                                        </ul>
-                                      </section>
-                                    )}
-                                    {context.issues.length > 0 && (
-                                      <section className="rounded-lg bg-zinc-50 p-3">
-                                        <p className="mb-2 text-xs font-semibold tracking-wide text-zinc-500 uppercase">
-                                          Issues
-                                        </p>
-                                        <ul className="space-y-1">
-                                          {context.issues.map((issue) => (
-                                            <li key={issue} className="text-sm text-zinc-700">
-                                              - {issue}
-                                            </li>
-                                          ))}
-                                        </ul>
-                                      </section>
-                                    )}
-                                  </div>
-                                )}
-
-                                {context.evidence.length > 0 && (
-                                  <section className="rounded-lg bg-zinc-50 p-3">
-                                    <p className="mb-2 text-xs font-semibold tracking-wide text-zinc-500 uppercase">
-                                      Evidence
-                                    </p>
-                                    <ul className="space-y-1.5">
-                                      {context.evidence.slice(0, 6).map((item, idx) => (
-                                        <li key={`${item.time}-${item.source}-${idx}`} className="text-xs text-zinc-600">
-                                          <span className="font-medium text-zinc-700">
-                                            [{item.time || "--:--"}] [{item.source || "log"}]
-                                          </span>{" "}
-                                          {item.text}
-                                        </li>
-                                      ))}
-                                    </ul>
-                                  </section>
-                                )}
-                              </AccordionContent>
-                            </AccordionItem>
-                          ))}
-                        </Accordion>
-                      ) : (
-                        <>
-                          <section className="rounded-lg border p-3">
-                            <p className="mb-2 text-xs font-semibold tracking-wide text-zinc-500 uppercase">
-                              Done
+                            </div>
+                            <p className="mt-1 truncate text-xs text-zinc-500">
+                              {context.summary}
                             </p>
-                            {record.merged.doneTodos.length > 0 ? (
+                          </div>
+                        </AccordionTrigger>
+                        <AccordionContent className="space-y-3">
+                          {context.doneTodos.length > 0 && (
+                            <section className="rounded-lg bg-emerald-50/60 p-3">
+                              <p className="mb-2 text-xs font-semibold tracking-wide text-emerald-700 uppercase">
+                                Done
+                              </p>
                               <ul className="space-y-1.5">
-                                {record.merged.doneTodos.map((todo) => (
+                                {context.doneTodos.map((todo) => (
                                   <li key={todo} className="flex items-start gap-2 text-sm text-zinc-800">
                                     <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-emerald-600" />
                                     <span>{todo}</span>
                                   </li>
                                 ))}
                               </ul>
-                            ) : (
-                              <p className="text-sm text-zinc-400">No completed todo.</p>
-                            )}
-                          </section>
+                            </section>
+                          )}
 
-                        </>
-                      )}
-                    </div>
-                  ) : (
-                    <p className="whitespace-pre-wrap text-sm leading-relaxed text-zinc-700">
-                      {record.summary}
-                    </p>
-                  )}
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p className="px-4 py-8 text-center text-sm text-zinc-400">
-              No records for this date yet. Try running Wrap Up Today.
-            </p>
-          )}
+                          {(context.workLogs.length > 0 || context.issues.length > 0) && (
+                            <div className="grid gap-3 md:grid-cols-2">
+                              {context.workLogs.length > 0 && (
+                                <section className="rounded-lg bg-zinc-50 p-3">
+                                  <p className="mb-2 text-xs font-semibold tracking-wide text-zinc-500 uppercase">
+                                    Work Logs
+                                  </p>
+                                  <ul className="space-y-1">
+                                    {context.workLogs.map((log) => (
+                                      <li key={log} className="text-sm text-zinc-700">
+                                        - {log}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </section>
+                              )}
+                              {context.issues.length > 0 && (
+                                <section className="rounded-lg bg-zinc-50 p-3">
+                                  <p className="mb-2 text-xs font-semibold tracking-wide text-zinc-500 uppercase">
+                                    Issues
+                                  </p>
+                                  <ul className="space-y-1">
+                                    {context.issues.map((issue) => (
+                                      <li key={issue} className="text-sm text-zinc-700">
+                                        - {issue}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </section>
+                              )}
+                            </div>
+                          )}
+
+                          {context.evidence.length > 0 && (
+                            <section className="rounded-lg bg-zinc-50 p-3">
+                              <p className="mb-2 text-xs font-semibold tracking-wide text-zinc-500 uppercase">
+                                Evidence
+                              </p>
+                              <ul className="space-y-1.5">
+                                {context.evidence.slice(0, 6).map((item, idx) => (
+                                  <li key={`${item.time}-${item.source}-${idx}`} className="text-xs text-zinc-600">
+                                    <span className="font-medium text-zinc-700">
+                                      [{item.time || "--:--"}] [{item.source || "log"}]
+                                    </span>{" "}
+                                    {item.text}
+                                  </li>
+                                ))}
+                              </ul>
+                            </section>
+                          )}
+                        </AccordionContent>
+                      </AccordionItem>
+                    ))}
+                  </Accordion>
+                )}
+
+                <Accordion type="single" collapsible className="rounded-lg border px-3">
+                  <AccordionItem value="source-records" className="border-zinc-200">
+                    <AccordionTrigger className="py-3">
+                      <span className="text-sm font-medium text-zinc-700">
+                        Source records ({activeRecordList.length})
+                      </span>
+                    </AccordionTrigger>
+                    <AccordionContent>
+                      <ul className="space-y-2">
+                        {activeRecordList.map((record) => (
+                          <li key={record.id} className="rounded-md bg-zinc-50 p-2">
+                            <p className="text-xs text-zinc-500">{formatDateTime(record.createdAt)}</p>
+                            <p className="mt-1 text-sm text-zinc-800">
+                              {(record.merged?.dailySummary || summaryTitle(record)).slice(0, 120)}
+                            </p>
+                          </li>
+                        ))}
+                      </ul>
+                    </AccordionContent>
+                  </AccordionItem>
+                </Accordion>
+              </div>
+            ) : (
+              <p className="px-4 py-8 text-center text-sm text-zinc-400">
+                No records for this range yet. Try running Wrap Up Today.
+              </p>
+            )}
+          </div>
         </div>
       )}
     </section>

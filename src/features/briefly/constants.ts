@@ -15,6 +15,7 @@ export const ONBOARDING_STEP_LABELS = ["Name", "Path Search"] as const;
 
 export const PROFILE_STORAGE_KEY = "briefly.profile.v3";
 export const RECORD_STORAGE_KEY = "briefly.records.v2";
+export const ROLLUP_STORAGE_KEY = "briefly.rollups.v1";
 
 export const EMPTY_PROFILE: ProfileConfig = {
   name: "",

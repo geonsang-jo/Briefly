@@ -32,6 +32,22 @@ export type SummaryRecordFile = {
   merged?: MergedSummaryData;
 };
 
+export type RollupPeriod = "week" | "month";
+
+export type SummaryRollup = {
+  id: string;
+  createdAt: string;
+  period: RollupPeriod;
+  periodKey: string;
+  startDateKey: string;
+  endDateKey: string;
+  sourceDateKeys: string[];
+  summary: string;
+  merged?: MergedSummaryData;
+};
+
+export type SummaryRollupFile = SummaryRollup;
+
 export type SummaryEvidenceItem = {
   time: string;
   source: string;

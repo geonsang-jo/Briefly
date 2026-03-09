@@ -17,8 +17,10 @@ import {
   clearOnboardingStorage,
   loadProfile,
   loadRecords,
+  loadRollups,
   saveProfile,
   saveRecord,
+  saveRollup,
 } from "@/features/briefly/storage";
 import {
   requestAutoCollectedConversation,
@@ -34,9 +36,11 @@ import type {
   PathProviderKey,
   ProfileConfig,
   ProviderSummaryData,
+  RollupPeriod,
   SummaryContextData,
   SummaryEvidenceItem,
   SummaryRecord,
+  SummaryRollup,
 } from "@/features/briefly/types";
 import {
   createLocalSummary,
@@ -672,6 +676,253 @@ function upsertRecordByDate(
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
+function parseDateKeyToDate(dateKey: string): Date | null {
+  const [yearRaw, monthRaw, dayRaw] = dateKey.split("-");
+  const year = Number(yearRaw);
+  const month = Number(monthRaw);
+  const day = Number(dayRaw);
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) {
+    return null;
+  }
+  const parsed = new Date(year, month - 1, day);
+  parsed.setHours(0, 0, 0, 0);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function dateToKey(date: Date): string {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(
+    date.getDate(),
+  ).padStart(2, "0")}`;
+}
+
+function shiftDate(date: Date, days: number): Date {
+  const result = new Date(date);
+  result.setHours(0, 0, 0, 0);
+  result.setDate(result.getDate() + days);
+  return result;
+}
+
+function toMonthKey(dateKey: string): string | null {
+  const parsed = parseDateKeyToDate(dateKey);
+  if (!parsed) return null;
+  return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function upsertRollupByPeriod(
+  prev: SummaryRollup[],
+  nextRollup: SummaryRollup,
+): SummaryRollup[] {
+  return [nextRollup, ...prev]
+    .filter((item, index, array) => {
+      const current = `${item.period}:${item.periodKey}`;
+      const firstIndex = array.findIndex(
+        (candidate) => `${candidate.period}:${candidate.periodKey}` === current,
+      );
+      return firstIndex === index;
+    })
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+function summarizeRollupTitle(
+  period: RollupPeriod,
+  periodKey: string,
+  merged: MergedSummaryData,
+): string {
+  const title = merged.dailySummary || "업무 요약";
+  if (period === "week") return `# Weekly Wrap-up (${periodKey})\n\n${title}`;
+  return `# Monthly Wrap-up (${periodKey})\n\n${title}`;
+}
+
+function mergeMergedSummaries(
+  items: MergedSummaryData[],
+  dateKey: string,
+): MergedSummaryData {
+  const summaryCandidates = cleanList(items.map((item) => item.dailySummary));
+  const contextsMap = new Map<string, SummaryContextData>();
+  const connectedProviders = cleanList(
+    items.flatMap((item) => item.connectedProviders),
+  );
+  const doneTodos = cleanList(items.flatMap((item) => item.doneTodos));
+  const workLogs = cleanList(items.flatMap((item) => item.workLogs));
+  const issues = cleanList(items.flatMap((item) => item.issues));
+  const evidence = dedupeEvidenceItems(items.flatMap((item) => item.evidence));
+
+  const upsertContext = (name: string): SummaryContextData => {
+    const normalizedName = name.trim() || DEFAULT_CONTEXT_NAME;
+    const key = normalizeCompareKey(normalizedName) || DEFAULT_CONTEXT_NAME.toLowerCase();
+    const existing = contextsMap.get(key);
+    if (existing) return existing;
+    const created: SummaryContextData = {
+      name: normalizedName,
+      summary: "",
+      doneTodos: [],
+      workLogs: [],
+      issues: [],
+      evidence: [],
+    };
+    contextsMap.set(key, created);
+    return created;
+  };
+
+  for (const merged of items) {
+    if (merged.contexts.length > 0) {
+      for (const context of merged.contexts) {
+        const bucket = upsertContext(context.name);
+        bucket.doneTodos.push(...context.doneTodos);
+        bucket.workLogs.push(...context.workLogs);
+        bucket.issues.push(...context.issues);
+        bucket.evidence.push(...context.evidence);
+      }
+      continue;
+    }
+
+    const fallback = upsertContext(DEFAULT_CONTEXT_NAME);
+    fallback.doneTodos.push(...merged.doneTodos);
+    fallback.workLogs.push(...merged.workLogs);
+    fallback.issues.push(...merged.issues);
+    fallback.evidence.push(...merged.evidence);
+  }
+
+  const contexts = Array.from(contextsMap.values())
+    .map((context) => {
+      const normalized: SummaryContextData = {
+        name: context.name,
+        summary: "",
+        doneTodos: cleanList(context.doneTodos),
+        workLogs: cleanList(context.workLogs),
+        issues: cleanList(context.issues),
+        evidence: dedupeEvidenceItems(context.evidence),
+      };
+      normalized.summary = getContextSummary(normalized);
+      return normalized;
+    })
+    .filter(
+      (context) =>
+        context.doneTodos.length > 0 ||
+        context.workLogs.length > 0 ||
+        context.issues.length > 0 ||
+        context.evidence.length > 0,
+    )
+    .sort((a, b) => {
+      const aScore =
+        a.doneTodos.length + a.workLogs.length + a.issues.length + a.evidence.length;
+      const bScore =
+        b.doneTodos.length + b.workLogs.length + b.issues.length + b.evidence.length;
+      if (bScore !== aScore) return bScore - aScore;
+      return a.name.localeCompare(b.name);
+    });
+
+  return {
+    version: "1",
+    dateKey,
+    connectedProviders,
+    dailySummary:
+      summaryCandidates[0] ??
+      (items.length > 1 ? `${items.length}일치 작업을 통합한 요약입니다.` : "작업 요약이 없습니다."),
+    doneTodos,
+    workLogs,
+    issues,
+    evidence,
+    contexts,
+  };
+}
+
+type ClosedPeriodCandidate = {
+  period: RollupPeriod;
+  periodKey: string;
+  startDateKey: string;
+  endDateKey: string;
+  sourceDateKeys: string[];
+  mergedItems: MergedSummaryData[];
+};
+
+function buildClosedPeriodCandidates(records: SummaryRecord[], now: Date): ClosedPeriodCandidate[] {
+  const today = new Date(now);
+  today.setHours(0, 0, 0, 0);
+
+  const byWeek = new Map<
+    string,
+    { start: string; end: string; source: string[]; merged: MergedSummaryData[] }
+  >();
+  const byMonth = new Map<
+    string,
+    { start: string; end: string; source: string[]; merged: MergedSummaryData[] }
+  >();
+
+  for (const record of records) {
+    const dateKey = recordDateKey(record);
+    const parsed = parseDateKeyToDate(dateKey);
+    if (!parsed || !record.merged) continue;
+
+    const diffToMonday = parsed.getDay() === 0 ? -6 : 1 - parsed.getDay();
+    const weekStart = shiftDate(parsed, diffToMonday);
+    const weekStartKey = dateToKey(weekStart);
+    const weekEndKey = dateToKey(shiftDate(weekStart, 6));
+    if (weekStartKey) {
+      const weekBucket = byWeek.get(weekStartKey) ?? {
+        start: weekStartKey,
+        end: weekEndKey,
+        source: [],
+        merged: [],
+      };
+      weekBucket.source.push(dateKey);
+      weekBucket.merged.push(record.merged);
+      byWeek.set(weekStartKey, weekBucket);
+    }
+
+    const monthKey = toMonthKey(dateKey);
+    if (monthKey) {
+      const monthStart = parseDateKeyToDate(`${monthKey}-01`);
+      if (monthStart) {
+        const monthEnd = new Date(monthStart.getFullYear(), monthStart.getMonth() + 1, 0);
+        monthEnd.setHours(0, 0, 0, 0);
+        const monthBucket = byMonth.get(monthKey) ?? {
+          start: dateToKey(monthStart),
+          end: dateToKey(monthEnd),
+          source: [],
+          merged: [],
+        };
+        monthBucket.source.push(dateKey);
+        monthBucket.merged.push(record.merged);
+        byMonth.set(monthKey, monthBucket);
+      }
+    }
+  }
+
+  const candidates: ClosedPeriodCandidate[] = [];
+
+  for (const [periodKey, value] of byWeek.entries()) {
+    const end = parseDateKeyToDate(value.end);
+    if (!end || end.getTime() >= today.getTime()) continue;
+    candidates.push({
+      period: "week",
+      periodKey,
+      startDateKey: value.start,
+      endDateKey: value.end,
+      sourceDateKeys: cleanList(value.source).sort(),
+      mergedItems: value.merged,
+    });
+  }
+
+  for (const [periodKey, value] of byMonth.entries()) {
+    const end = parseDateKeyToDate(value.end);
+    if (!end || end.getTime() >= today.getTime()) continue;
+    candidates.push({
+      period: "month",
+      periodKey,
+      startDateKey: value.start,
+      endDateKey: value.end,
+      sourceDateKeys: cleanList(value.source).sort(),
+      mergedItems: value.merged,
+    });
+  }
+
+  return candidates.sort((a, b) => {
+    if (a.period !== b.period) return a.period.localeCompare(b.period);
+    return b.periodKey.localeCompare(a.periodKey);
+  });
+}
+
 function App() {
   const [profile, setProfile] = useState<ProfileConfig>({ ...EMPTY_PROFILE });
   const [formProfile, setFormProfile] = useState<ProfileConfig>({
@@ -684,6 +935,9 @@ function App() {
   const [view, setView] = useState<AppView>("home");
   const [conversationInput, setConversationInput] = useState("");
   const [records, setRecords] = useState<SummaryRecord[]>([]);
+  const [rollups, setRollups] = useState<SummaryRollup[]>([]);
+  const rollupsRef = useRef<SummaryRollup[]>([]);
+  const isEnsuringRollupsRef = useRef(false);
 
   const [isSummarizing, setIsSummarizing] = useState(false);
   const [isCollecting, setIsCollecting] = useState(false);
@@ -702,6 +956,10 @@ function App() {
     () => [...records].sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
     [records],
   );
+
+  useEffect(() => {
+    rollupsRef.current = rollups;
+  }, [rollups]);
 
   const weeklyGroups = useMemo(() => {
     const map = new Map<string, SummaryRecord[]>();
@@ -734,9 +992,10 @@ function App() {
 
     async function hydrateStorage() {
       try {
-        const [loadedProfile, loadedRecords] = await Promise.all([
+        const [loadedProfile, loadedRecords, loadedRollups] = await Promise.all([
           loadProfile(),
           loadRecords(),
+          loadRollups(),
         ]);
 
         if (cancelled) return;
@@ -745,6 +1004,8 @@ function App() {
         setProfile(nextProfile);
         setFormProfile(nextProfile);
         setRecords(loadedRecords);
+        setRollups(loadedRollups);
+        rollupsRef.current = loadedRollups;
       } finally {
         if (!cancelled) {
           setIsStorageReady(true);
@@ -757,6 +1018,63 @@ function App() {
       cancelled = true;
     };
   }, []);
+
+  async function ensureClosedRollups(
+    sourceRecords: SummaryRecord[],
+    currentRollups: SummaryRollup[] = rollupsRef.current,
+    appendLog?: (kind: WrapUpLogKind, text: string) => void,
+  ): Promise<void> {
+    if (isEnsuringRollupsRef.current) return;
+
+    isEnsuringRollupsRef.current = true;
+    try {
+      const existing = new Set(
+        currentRollups.map((item) => `${item.period}:${item.periodKey}`),
+      );
+      const candidates = buildClosedPeriodCandidates(sourceRecords, new Date());
+      let nextRollups = [...currentRollups];
+
+      for (const candidate of candidates) {
+        const rollupKey = `${candidate.period}:${candidate.periodKey}`;
+        if (existing.has(rollupKey)) continue;
+        if (candidate.mergedItems.length === 0) continue;
+
+        const merged = mergeMergedSummaries(
+          candidate.mergedItems,
+          candidate.startDateKey,
+        );
+        const createdAt = new Date().toISOString();
+        const rollup: SummaryRollup = {
+          id: `${candidate.period}-${candidate.periodKey}-${Date.now()}-${Math.floor(
+            Math.random() * 1000,
+          )}`,
+          createdAt,
+          period: candidate.period,
+          periodKey: candidate.periodKey,
+          startDateKey: candidate.startDateKey,
+          endDateKey: candidate.endDateKey,
+          sourceDateKeys: candidate.sourceDateKeys,
+          summary: summarizeRollupTitle(candidate.period, candidate.periodKey, merged),
+          merged,
+        };
+
+        await saveRollup(rollup);
+        existing.add(rollupKey);
+        nextRollups = upsertRollupByPeriod(nextRollups, rollup);
+        appendLog?.(
+          "ok",
+          `Generated ${candidate.period} rollup (${candidate.periodKey}).`,
+        );
+      }
+
+      if (nextRollups.length !== currentRollups.length) {
+        setRollups(nextRollups);
+        rollupsRef.current = nextRollups;
+      }
+    } finally {
+      isEnsuringRollupsRef.current = false;
+    }
+  }
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -888,7 +1206,9 @@ function App() {
       };
 
       await saveRecord(record);
-      setRecords((prev) => upsertRecordByDate(prev, record));
+      const nextRecords = upsertRecordByDate(records, record);
+      setRecords(nextRecords);
+      await ensureClosedRollups(nextRecords, rollupsRef.current);
 
       setConversationInput("");
 
@@ -1067,10 +1387,10 @@ function App() {
         "ok",
         `Saved summary to ~/.briefly/records/${savedDateKey}/summary.md`,
       );
+      const nextRecords = upsertRecordByDate(records, record);
+      setRecords(nextRecords);
+      await ensureClosedRollups(nextRecords, rollupsRef.current, appendWrapUpLog);
       appendWrapUpLog("ok", "Wrap-up completed.");
-      setRecords((prev) =>
-        upsertRecordByDate(prev, record),
-      );
 
       setFeedbackTone(usedFallback ? "error" : "normal");
       setWrapUpRunStatus(usedFallback ? "error" : "done");
@@ -1115,6 +1435,7 @@ function App() {
     setProfile({ ...EMPTY_PROFILE });
     setFormProfile({ ...EMPTY_PROFILE });
     setRecords([]);
+    setRollups([]);
     setConversationInput("");
     setPathStatus(null);
     setOnboardingStep(0);

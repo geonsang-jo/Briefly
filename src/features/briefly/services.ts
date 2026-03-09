@@ -7,6 +7,8 @@ import type {
   ProfileConfig,
   ProviderSummaryData,
   SummaryRecordFile,
+  SummaryRollupFile,
+  RollupPeriod,
 } from "@/features/briefly/types";
 
 function isTauriAvailable(): boolean {
@@ -120,6 +122,37 @@ export async function requestSaveRecordToFs(
   }
 
   await invoke("save_record_to_fs", { record });
+}
+
+export async function requestListRollupsFromFs(): Promise<SummaryRollupFile[]> {
+  if (!isTauriAvailable()) return [];
+  return invoke<SummaryRollupFile[]>("list_rollups_from_fs");
+}
+
+export async function requestSaveRollupToFs(
+  rollup: Pick<
+    SummaryRollupFile,
+    | "id"
+    | "createdAt"
+    | "period"
+    | "periodKey"
+    | "startDateKey"
+    | "endDateKey"
+    | "sourceDateKeys"
+    | "summary"
+  > & {
+    merged?: MergedSummaryData;
+  },
+): Promise<void> {
+  if (!isTauriAvailable()) {
+    throw new Error("Tauri 런타임이 아니어서 롤업 파일 저장을 실행할 수 없습니다.");
+  }
+
+  const payload = {
+    ...rollup,
+    period: rollup.period as RollupPeriod,
+  };
+  await invoke("save_rollup_to_fs", { rollup: payload });
 }
 
 export async function requestClearBrieflyStorage(): Promise<void> {

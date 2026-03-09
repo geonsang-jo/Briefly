@@ -1,13 +1,16 @@
 import {
   PROFILE_STORAGE_KEY,
   RECORD_STORAGE_KEY,
+  ROLLUP_STORAGE_KEY,
 } from "@/features/briefly/constants";
 import {
   requestClearBrieflyStorage,
   requestListRecordsFromFs,
+  requestListRollupsFromFs,
   requestLoadProfileFromFs,
   requestSaveProfileToFs,
   requestSaveRecordToFs,
+  requestSaveRollupToFs,
 } from "@/features/briefly/services";
 import type {
   MergedSummaryData,
@@ -15,6 +18,8 @@ import type {
   ProviderSummaryData,
   SummaryRecord,
   SummaryRecordFile,
+  SummaryRollup,
+  SummaryRollupFile,
 } from "@/features/briefly/types";
 import { isValidDate } from "@/features/briefly/utils";
 
@@ -178,6 +183,38 @@ function normalizeRecord(
   };
 }
 
+function normalizeRollup(
+  item: Partial<SummaryRollup> &
+    Partial<SummaryRollupFile> & { period?: string | null },
+): SummaryRollup | null {
+  if (!item || typeof item !== "object") return null;
+  if (typeof item.id !== "string" || !item.id.trim()) return null;
+  if (typeof item.createdAt !== "string" || !isValidDate(item.createdAt)) {
+    return null;
+  }
+  if (item.period !== "week" && item.period !== "month") return null;
+  if (typeof item.periodKey !== "string" || !item.periodKey.trim()) return null;
+  if (typeof item.startDateKey !== "string" || !item.startDateKey.trim()) return null;
+  if (typeof item.endDateKey !== "string" || !item.endDateKey.trim()) return null;
+  if (typeof item.summary !== "string") return null;
+
+  const sourceDateKeys = Array.isArray(item.sourceDateKeys)
+    ? item.sourceDateKeys.filter((value): value is string => typeof value === "string")
+    : [];
+
+  return {
+    id: item.id,
+    createdAt: item.createdAt,
+    period: item.period,
+    periodKey: item.periodKey,
+    startDateKey: item.startDateKey,
+    endDateKey: item.endDateKey,
+    sourceDateKeys,
+    summary: item.summary,
+    merged: normalizeMergedSummary(item.merged),
+  };
+}
+
 function loadRecordsFromLocalStorage(): SummaryRecord[] {
   const raw = readJson<SummaryRecord[]>(RECORD_STORAGE_KEY, []);
   if (!Array.isArray(raw)) return [];
@@ -212,6 +249,38 @@ function appendRecordToLocalStorage(record: SummaryRecord): void {
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 
   writeJson(RECORD_STORAGE_KEY, next);
+}
+
+function loadRollupsFromLocalStorage(): SummaryRollup[] {
+  const raw = readJson<SummaryRollup[]>(ROLLUP_STORAGE_KEY, []);
+  if (!Array.isArray(raw)) return [];
+
+  return raw
+    .map((item) => normalizeRollup(item))
+    .filter((item): item is SummaryRollup => Boolean(item))
+    .filter((item, index, array) => {
+      const key = `${item.period}:${item.periodKey}`;
+      const firstIndex = array.findIndex(
+        (candidate) => `${candidate.period}:${candidate.periodKey}` === key,
+      );
+      return firstIndex === index;
+    })
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+function appendRollupToLocalStorage(rollup: SummaryRollup): void {
+  const current = loadRollupsFromLocalStorage();
+  const next = [rollup, ...current]
+    .filter((item, index, array) => {
+      const key = `${item.period}:${item.periodKey}`;
+      const firstIndex = array.findIndex(
+        (candidate) => `${candidate.period}:${candidate.periodKey}` === key,
+      );
+      return firstIndex === index;
+    })
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+  writeJson(ROLLUP_STORAGE_KEY, next);
 }
 
 export async function loadProfile(): Promise<ProfileConfig | null> {
@@ -308,6 +377,42 @@ export async function saveRecord(record: SummaryRecord): Promise<void> {
   }
 }
 
+export async function loadRollups(): Promise<SummaryRollup[]> {
+  try {
+    const fromFs = await requestListRollupsFromFs();
+    const normalized = fromFs
+      .map((item) => normalizeRollup(item))
+      .filter((item): item is SummaryRollup => Boolean(item))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    if (normalized.length > 0) {
+      return normalized;
+    }
+  } catch {
+    // Fallback to local storage below.
+  }
+
+  return loadRollupsFromLocalStorage();
+}
+
+export async function saveRollup(rollup: SummaryRollup): Promise<void> {
+  try {
+    await requestSaveRollupToFs({
+      id: rollup.id,
+      createdAt: rollup.createdAt,
+      period: rollup.period,
+      periodKey: rollup.periodKey,
+      startDateKey: rollup.startDateKey,
+      endDateKey: rollup.endDateKey,
+      sourceDateKeys: rollup.sourceDateKeys,
+      summary: rollup.summary,
+      merged: rollup.merged,
+    });
+    return;
+  } catch {
+    appendRollupToLocalStorage(rollup);
+  }
+}
+
 export async function clearOnboardingStorage(): Promise<void> {
   try {
     await requestClearBrieflyStorage();
@@ -317,4 +422,5 @@ export async function clearOnboardingStorage(): Promise<void> {
 
   localStorage.removeItem(PROFILE_STORAGE_KEY);
   localStorage.removeItem(RECORD_STORAGE_KEY);
+  localStorage.removeItem(ROLLUP_STORAGE_KEY);
 }

@@ -65,6 +65,18 @@ struct FsRecordMeta {
     date_key: String,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FsRollupMeta {
+    id: String,
+    created_at: String,
+    period: String,
+    period_key: String,
+    start_date_key: String,
+    end_date_key: String,
+    source_date_keys: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SummaryEvidenceItem {
@@ -124,6 +136,20 @@ struct FsRecordItem {
     merged: Option<MergedSummaryData>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FsRollupItem {
+    id: String,
+    created_at: String,
+    period: String,
+    period_key: String,
+    start_date_key: String,
+    end_date_key: String,
+    source_date_keys: Vec<String>,
+    summary: String,
+    merged: Option<MergedSummaryData>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SaveRecordInput {
@@ -133,6 +159,20 @@ struct SaveRecordInput {
     date_key: Option<String>,
     summary: String,
     provider_results: Option<Vec<ProviderSummaryData>>,
+    merged: Option<MergedSummaryData>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveRollupInput {
+    id: String,
+    created_at: String,
+    period: String,
+    period_key: String,
+    start_date_key: String,
+    end_date_key: String,
+    source_date_keys: Vec<String>,
+    summary: String,
     merged: Option<MergedSummaryData>,
 }
 
@@ -402,6 +442,14 @@ fn briefly_records_dir(base: &Path) -> PathBuf {
     base.join("records")
 }
 
+fn briefly_rollups_dir(base: &Path) -> PathBuf {
+    base.join("rollups")
+}
+
+fn briefly_rollup_period_dir(base: &Path, period: &str) -> PathBuf {
+    briefly_rollups_dir(base).join(period)
+}
+
 fn ensure_briefly_dirs(base: &Path) -> Result<(), String> {
     fs::create_dir_all(base)
         .map_err(|err| format!("Failed to create briefly base dir {}: {err}", base.display()))?;
@@ -410,6 +458,20 @@ fn ensure_briefly_dirs(base: &Path) -> Result<(), String> {
         format!(
             "Failed to create briefly records dir {}: {err}",
             records_dir.display()
+        )
+    })?;
+    let week_rollups_dir = briefly_rollup_period_dir(base, "week");
+    fs::create_dir_all(&week_rollups_dir).map_err(|err| {
+        format!(
+            "Failed to create briefly week rollups dir {}: {err}",
+            week_rollups_dir.display()
+        )
+    })?;
+    let month_rollups_dir = briefly_rollup_period_dir(base, "month");
+    fs::create_dir_all(&month_rollups_dir).map_err(|err| {
+        format!(
+            "Failed to create briefly month rollups dir {}: {err}",
+            month_rollups_dir.display()
         )
     })?;
     Ok(())
@@ -454,6 +516,40 @@ fn parse_date_key(value: &str) -> Option<String> {
     NaiveDate::parse_from_str(value, "%Y-%m-%d")
         .ok()
         .map(|date| date.format("%Y-%m-%d").to_string())
+}
+
+fn parse_month_key(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let mut chunks = trimmed.split('-');
+    let year = chunks.next()?.parse::<i32>().ok()?;
+    let month = chunks.next()?.parse::<u32>().ok()?;
+    if chunks.next().is_some() {
+        return None;
+    }
+    if month == 0 || month > 12 {
+        return None;
+    }
+    Some(format!("{year:04}-{month:02}"))
+}
+
+fn normalize_rollup_period(value: &str) -> Option<String> {
+    match value.trim() {
+        "week" => Some("week".to_string()),
+        "month" => Some("month".to_string()),
+        _ => None,
+    }
+}
+
+fn normalize_rollup_period_key(period: &str, value: &str) -> Option<String> {
+    if period == "week" {
+        return parse_date_key(value);
+    }
+
+    if period == "month" {
+        return parse_month_key(value);
+    }
+
+    None
 }
 
 fn date_key_from_created_at(created_at: &str) -> String {
@@ -505,6 +601,20 @@ fn strip_markdown_front_matter(content: &str) -> String {
 fn summary_markdown(date_key: &str, provider: &str, created_at: &str, summary: &str) -> String {
     format!(
         "---\ndate: {date_key}\nprovider: {provider}\ncreatedAt: {created_at}\n---\n\n{}\n",
+        summary.trim()
+    )
+}
+
+fn rollup_markdown(
+    period: &str,
+    period_key: &str,
+    start_date_key: &str,
+    end_date_key: &str,
+    created_at: &str,
+    summary: &str,
+) -> String {
+    format!(
+        "---\nperiod: {period}\nperiodKey: {period_key}\nstartDateKey: {start_date_key}\nendDateKey: {end_date_key}\ncreatedAt: {created_at}\n---\n\n{}\n",
         summary.trim()
     )
 }
@@ -1252,6 +1362,200 @@ async fn save_record_to_fs(record: SaveRecordInput) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn list_rollups_from_fs() -> Result<Vec<FsRollupItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_dir = briefly_base_dir()?;
+        let rollups_dir = briefly_rollups_dir(&base_dir);
+        if !rollups_dir.exists() || !rollups_dir.is_dir() {
+            return Ok(Vec::new());
+        }
+
+        let mut items = Vec::new();
+
+        for period in ["week", "month"] {
+            let period_dir = briefly_rollup_period_dir(&base_dir, period);
+            if !period_dir.exists() || !period_dir.is_dir() {
+                continue;
+            }
+
+            let entries = match fs::read_dir(&period_dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+
+            for entry in entries.flatten() {
+                let rollup_dir = entry.path();
+                if !rollup_dir.is_dir() {
+                    continue;
+                }
+
+                let fallback_period_key = entry
+                    .file_name()
+                    .to_str()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+
+                let meta_path = rollup_dir.join("meta.json");
+                let summary_path = rollup_dir.join("summary.md");
+                let merged_path = rollup_dir.join("merged.json");
+
+                let meta_raw = match fs::read_to_string(&meta_path) {
+                    Ok(content) => content,
+                    Err(_) => continue,
+                };
+                let meta: FsRollupMeta = match serde_json::from_str(&meta_raw) {
+                    Ok(meta) => meta,
+                    Err(_) => continue,
+                };
+
+                let normalized_period = match normalize_rollup_period(&meta.period) {
+                    Some(value) => value,
+                    None => continue,
+                };
+                let normalized_period_key = normalize_rollup_period_key(
+                    &normalized_period,
+                    if meta.period_key.trim().is_empty() {
+                        &fallback_period_key
+                    } else {
+                        &meta.period_key
+                    },
+                )
+                .or_else(|| normalize_rollup_period_key(&normalized_period, &fallback_period_key))
+                .unwrap_or_default();
+
+                if normalized_period_key.is_empty()
+                    || meta.id.trim().is_empty()
+                    || meta.created_at.trim().is_empty()
+                {
+                    continue;
+                }
+
+                let summary = match fs::read_to_string(&summary_path) {
+                    Ok(content) => strip_markdown_front_matter(&content),
+                    Err(_) => String::new(),
+                };
+                let merged = fs::read_to_string(&merged_path)
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<MergedSummaryData>(&raw).ok());
+
+                let effective_summary = if summary.trim().is_empty() {
+                    merged
+                        .as_ref()
+                        .map(|value| value.daily_summary.trim().to_string())
+                        .unwrap_or_default()
+                } else {
+                    summary
+                };
+
+                if effective_summary.trim().is_empty() {
+                    continue;
+                }
+
+                items.push(FsRollupItem {
+                    id: meta.id,
+                    created_at: meta.created_at,
+                    period: normalized_period,
+                    period_key: normalized_period_key,
+                    start_date_key: parse_date_key(&meta.start_date_key).unwrap_or_default(),
+                    end_date_key: parse_date_key(&meta.end_date_key).unwrap_or_default(),
+                    source_date_keys: meta
+                        .source_date_keys
+                        .iter()
+                        .filter_map(|value| parse_date_key(value))
+                        .collect::<Vec<String>>(),
+                    summary: effective_summary,
+                    merged,
+                });
+            }
+        }
+
+        items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(items)
+    })
+    .await
+    .map_err(|err| format!("Background task failed: {err}"))?
+}
+
+#[tauri::command]
+async fn save_rollup_to_fs(rollup: SaveRollupInput) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let id = rollup.id.trim().to_string();
+        if id.is_empty() {
+            return Err("Rollup id is empty.".to_string());
+        }
+
+        let period = normalize_rollup_period(&rollup.period)
+            .ok_or_else(|| "Rollup period is invalid.".to_string())?;
+        let period_key = normalize_rollup_period_key(&period, &rollup.period_key)
+            .ok_or_else(|| "Rollup period key is invalid.".to_string())?;
+        let start_date_key = parse_date_key(&rollup.start_date_key)
+            .ok_or_else(|| "Rollup start date key is invalid.".to_string())?;
+        let end_date_key = parse_date_key(&rollup.end_date_key)
+            .ok_or_else(|| "Rollup end date key is invalid.".to_string())?;
+        let created_at = if rollup.created_at.trim().is_empty() {
+            Local::now().to_rfc3339()
+        } else {
+            rollup.created_at.trim().to_string()
+        };
+
+        let source_date_keys = rollup
+            .source_date_keys
+            .iter()
+            .filter_map(|value| parse_date_key(value))
+            .collect::<Vec<String>>();
+
+        let base_dir = briefly_base_dir()?;
+        ensure_briefly_dirs(&base_dir)?;
+
+        let rollup_dir = briefly_rollup_period_dir(&base_dir, &period).join(&period_key);
+        fs::create_dir_all(&rollup_dir).map_err(|err| {
+            format!(
+                "Failed to create rollup dir {}: {err}",
+                rollup_dir.display()
+            )
+        })?;
+
+        let meta = FsRollupMeta {
+            id,
+            created_at: created_at.clone(),
+            period: period.clone(),
+            period_key: period_key.clone(),
+            start_date_key: start_date_key.clone(),
+            end_date_key: end_date_key.clone(),
+            source_date_keys,
+        };
+
+        let meta_content = serde_json::to_vec_pretty(&meta)
+            .map_err(|err| format!("Failed to serialize rollup meta: {err}"))?;
+        atomic_write(&rollup_dir.join("meta.json"), &meta_content)?;
+
+        let summary_md = rollup_markdown(
+            &period,
+            &period_key,
+            &start_date_key,
+            &end_date_key,
+            &created_at,
+            &rollup.summary,
+        );
+        atomic_write(&rollup_dir.join("summary.md"), summary_md.as_bytes())?;
+
+        let merged_path = rollup_dir.join("merged.json");
+        if let Some(merged) = rollup.merged {
+            let merged_content = serde_json::to_vec_pretty(&merged)
+                .map_err(|err| format!("Failed to serialize merged rollup: {err}"))?;
+            atomic_write(&merged_path, &merged_content)?;
+        } else if merged_path.exists() {
+            fs::remove_file(&merged_path)
+                .map_err(|err| format!("Failed to remove merged file {}: {err}", merged_path.display()))?;
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|err| format!("Background task failed: {err}"))?
+}
+
+#[tauri::command]
 async fn clear_briefly_storage() -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let base_dir = briefly_base_dir()?;
@@ -1356,6 +1660,8 @@ pub fn run() {
             save_profile_to_fs,
             list_records_from_fs,
             save_record_to_fs,
+            list_rollups_from_fs,
+            save_rollup_to_fs,
             clear_briefly_storage
         ])
         .run(tauri::generate_context!())
